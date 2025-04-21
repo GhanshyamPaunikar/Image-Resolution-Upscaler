@@ -1,0 +1,189 @@
+#!/usr/bin/env python
+"""
+ab_test.py
+
+This script performs an AB test between two models by running inference on every sample
+from the dataset (loaded from --data_dir) using both models. It computes the MSE loss
+between each model’s output and the ground truth, sums the losses, and prints the total
+and average losses for each model.
+
+New optional arguments:
+  --res_in: if provided (e.g., 720), only process samples where the LR image has height 720.
+  --res_out: if provided (e.g., 1080), only process samples where the HR image has height 1080.
+
+Usage:
+    python ab_test.py --data_dir <data_dir> --model_a <modelA_name> --model_b <modelB_name> [--batch_size 1]
+                       [--res_in 720] [--res_out 1080]
+Default checkpoint directories are assumed to be:
+    models/{model_a}/checkpoints and models/{model_b}/checkpoints.
+"""
+
+import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = '1'
+
+import lpips
+import argparse
+import importlib
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import torchvision.transforms as transforms
+
+import warnings
+
+
+from data_handling.data_class import highres_img_dataset
+from tools.utils import get_latest_checkpoint
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Custom collate function returns a tuple of lists
+def custom_collate_fn(batch):
+    lr_list, hr_list = zip(*batch)
+    return list(lr_list), list(hr_list)
+
+def main(args):
+    # Device selection.
+    if torch.backends.mps.is_built():
+        device = torch.device("mps")
+    elif torch.backends.cuda.is_built():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    print(f"Running AB test on device: {device}")
+
+    # Set up dataset and DataLoader with custom collate.
+    dataset = highres_img_dataset(args.data_dir, {"lr": (720, 1280), "hr": (1080, 1920)})
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
+                              num_workers=0, collate_fn=custom_collate_fn)
+
+    # Dynamically import models.
+    import_safe_model_a_arg = str(args.model_a).replace("/", '.')
+    model_module_a = importlib.import_module(f"models.{import_safe_model_a_arg}.model")
+    TransformerModelA = model_module_a.TransformerModel
+    import_safe_model_b_arg = str(args.model_b).replace("/", '.')
+    model_module_b = importlib.import_module(f"models.{import_safe_model_b_arg}.model")
+    TransformerModelB = model_module_b.TransformerModel
+
+    # Set default checkpoint directories if not provided.
+    checkpoint_dir_a = args.checkpoint_dir_a or os.path.join("models", args.model_a, "checkpoints")
+    checkpoint_dir_b = args.checkpoint_dir_b or os.path.join("models", args.model_b, "checkpoints")
+
+    # Load latest checkpoints.
+    ckpt_a, _ = get_latest_checkpoint(checkpoint_dir_a)
+    ckpt_b, _ = get_latest_checkpoint(checkpoint_dir_b)
+    print(f"Model A ({args.model_a}) checkpoint: {ckpt_a}")
+    print(f"Model B ({args.model_b}) checkpoint: {ckpt_b}")
+
+    # Instantiate models and load weights.
+    model_a = TransformerModelA().to(device)
+    model_b = TransformerModelB().to(device)
+
+    # Support checkpoints saved as {'model_state_dict': ...} or raw state_dict
+    checkpoint = torch.load(ckpt_a, map_location=device)
+    state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    model_a.load_state_dict(state_dict)
+    model_a.eval()
+
+    checkpoint = torch.load(ckpt_b, map_location=device)
+    state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    model_b.load_state_dict(state_dict)
+    model_b.eval()
+
+    # Define loss criterion.
+    criterion = nn.MSELoss(reduction="mean").to(device)
+    p_criterion = lpips.LPIPS(net='vgg').to(device).eval()
+
+    total_loss_a = 0.0
+    total_p_loss_a = 0.0
+    total_loss_b = 0.0
+    total_p_loss_b = 0.0
+    processed_samples = 0
+
+    # Option lr / hr resize transforms
+    if args.res_in is not None:
+        lr_transform = transforms.Resize(args.res_in)
+    if args.res_out is not None:
+        hr_transform = transforms.Resize(args.res_out)
+
+
+    # Loop over dataset without gradients.
+    with torch.no_grad():
+        for batch_idx, (lr_list, hr_list) in enumerate(dataloader):
+            for lr_img, hr_img in zip(lr_list, hr_list):
+                # Check resolution restrictions if provided.
+                if args.res_in is not None and lr_img.shape[1] != args.res_in:
+                    lr_img = lr_transform(lr_img)
+                if args.res_out is not None and hr_img.shape[1] != args.res_out:
+                    hr_img = hr_transform(hr_img)
+
+                # Skip if the lr image is smaller than the hr in height or width
+                if (hr_img.shape[1] / lr_img.shape[1]) <= 1 or (hr_img.shape[2] / lr_img.shape[2]) <= 1:
+                    continue
+
+                # Move images to device and add batch dimension.
+                lr_img = lr_img.unsqueeze(0).to(device)
+                hr_img = hr_img.unsqueeze(0).to(device)
+                # Determine target resolution from HR image.
+                target_res = (hr_img.shape[2], hr_img.shape[3])
+                # Run inference for both models.
+                output_a = model_a(lr_img, res_out=target_res)
+                output_b = model_b(lr_img, res_out=target_res)
+                #output_a = model_a(lr_img, upscale_factor=4)
+                #output_b = model_b(lr_img, upscale_factor=4)
+                # Compute losses.
+                loss_a = criterion(output_a, hr_img)
+                p_loss_a = p_criterion(output_a, hr_img)
+                loss_b = criterion(output_b, hr_img)
+                p_loss_b = p_criterion(output_b, hr_img)
+
+                total_loss_a += loss_a.item()
+                total_p_loss_a += p_loss_a.item()
+                total_loss_b += loss_b.item()
+                total_p_loss_b += p_loss_b.item()
+
+                processed_samples += 1
+            if (batch_idx + 1) % args.log_interval == 0:
+                print(f"Processed {processed_samples} samples so far...")
+
+            if args.max_samples is not None and processed_samples >= args.max_samples:
+                break
+
+    if processed_samples == 0:
+        print("No samples matched the specified resolution criteria.")
+        return
+
+    avg_loss_a = total_loss_a / processed_samples
+    avg_loss_b = total_loss_b / processed_samples
+    avg_p_loss_a = total_p_loss_a / processed_samples
+    avg_p_loss_b = total_p_loss_b / processed_samples
+
+    print("========================================")
+    print(f"Model A ({args.model_a}) Average Perceptive Loss: {avg_p_loss_a:.6f} | Average L1 Loss: {avg_loss_a:.6f}")
+    print(f"Model B ({args.model_b}) Average Perceptive Loss: {avg_p_loss_b:.6f} | Average L1 Loss: {avg_loss_b:.6f}")
+    print("========================================")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="AB Test for Transformer Upscaler Models")
+    parser.add_argument("--data_dir", type=str, default="training_set",
+                        help="Directory containing images (.jpg)")
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Batch size (number of samples per iteration)")
+    parser.add_argument("--log_interval", type=int, default=10,
+                        help="Log progress every N batches")
+    parser.add_argument("--model_a", type=str, required=True,
+                        help="Model A name (e.g., 'ResidualTransformer' or 'HierarchicalTransformer')")
+    parser.add_argument("--model_b", type=str, required=True,
+                        help="Model B name")
+    parser.add_argument("--checkpoint_dir_a", type=str, default=None,
+                        help="Checkpoint directory for model A (default: models/{model_a}/checkpoints/)")
+    parser.add_argument("--checkpoint_dir_b", type=str, default=None,
+                        help="Checkpoint directory for model B (default: models/{model_b}/checkpoints/)")
+    parser.add_argument("--res_in", type=int, default=None,
+                        help="Restrict testing to only LR images with this vertical resolution (e.g., 720)")
+    parser.add_argument("--res_out", type=int, default=None,
+                        help="Restrict testing to only HR images with this vertical resolution (e.g., 1080)")
+    parser.add_argument("--max_samples", type=int, default=30,
+                        help="Restrict testing to a max number of sample images.")
+    args = parser.parse_args()
+    main(args)
