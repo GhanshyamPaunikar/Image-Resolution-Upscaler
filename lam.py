@@ -82,7 +82,7 @@ def main():
         args.checkpoint_dir = f"models/{args.model}/checkpoints"
     checkpoint_path, _ = get_latest_checkpoint(args.checkpoint_dir)
     print(f'Loading checkpoint: {checkpoint_path}')
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint['model_state_dict'])
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model.eval()

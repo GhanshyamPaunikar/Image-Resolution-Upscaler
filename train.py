@@ -16,7 +16,7 @@ import torch
 import torch.optim as optim
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torchvision.transforms import transforms
 import importlib
 import warnings
@@ -53,13 +53,8 @@ def main(args):
     print(f"Training on device: {device}")
 
     # --- Autocast Setup ---
-    if device.type == "cuda":
-        amp_autocast = torch.cuda.amp.autocast
-    elif device.type == "mps":
-        try:
-            amp_autocast = lambda: torch.amp.autocast(device_type="mps")
-        except Exception:
-            amp_autocast = nullcontext
+    if device.type in ("cuda", "mps"):
+        amp_autocast = lambda: torch.amp.autocast(device_type=device.type, dtype=torch.float16)
     else:
         amp_autocast = nullcontext
 
@@ -115,7 +110,7 @@ def main(args):
     initial_lr = args.lr if (args.lr is not None) else 2e-4
     optimizer = optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=1e-4)
     
-    scaler = GradScaler(enabled=(device.type == 'cuda')) # Only enable for CUDA
+    scaler = GradScaler("cuda", enabled=(device.type == 'cuda'))  # Only enable for CUDA
     epochs_trained = 0
     # Adjust total_epochs for scheduler if you define epoch differently
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=250, gamma=0.5)
@@ -130,7 +125,7 @@ def main(args):
     if checkpoint_path and os.path.exists(checkpoint_path):
         try:
             print(f"Loading checkpoint: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location=device)
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
             # Support checkpoints saved as {'model_state_dict': ...} or raw state_dict
             state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
             model.load_state_dict(state_dict)

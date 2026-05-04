@@ -43,7 +43,7 @@ def main(args):
     model = TransformerModel().to(device)
     checkpoint_path, _ = get_latest_checkpoint(args.checkpoint_dir)
     print(f'Loading checkpoint: {checkpoint_path}')
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     # Support checkpoints saved as {'model_state_dict': ...} or raw state_dict
     state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
     model.load_state_dict(state_dict)

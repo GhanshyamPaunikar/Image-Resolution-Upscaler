@@ -48,7 +48,9 @@ def main(args):
     # Load latest checkpoint.
     checkpoint_path, _ = get_latest_checkpoint(args.checkpoint_dir)
     print(f"Loading checkpoint from: {checkpoint_path}")
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    state = ckpt.get('model_state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
+    model.load_state_dict(state)
     model.eval()
 
     # Transform for captured image.

@@ -80,12 +80,12 @@ def main(args):
     model_b = TransformerModelB().to(device)
 
     # Support checkpoints saved as {'model_state_dict': ...} or raw state_dict
-    checkpoint = torch.load(ckpt_a, map_location=device)
+    checkpoint = torch.load(ckpt_a, map_location=device, weights_only=True)
     state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
     model_a.load_state_dict(state_dict)
     model_a.eval()
 
-    checkpoint = torch.load(ckpt_b, map_location=device)
+    checkpoint = torch.load(ckpt_b, map_location=device, weights_only=True)
     state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
     model_b.load_state_dict(state_dict)
     model_b.eval()

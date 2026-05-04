@@ -93,14 +93,14 @@ def main(args):
 
     checkpoint_path, _ = get_latest_checkpoint(args.checkpoint_dir or f"models/{args.model}/checkpoints")
     print(f"Loading checkpoint: {checkpoint_path}")
-    state = torch.load(checkpoint_path, map_location='cpu')
+    state = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
     model.load_state_dict(state['model_state_dict'])
 
     if args.compile:
         model = torch.compile(model)
 
     if args.quantize:
-        model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+        model = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
 
     image_paths = [os.path.join(dp, f)
                    for dp, _, filenames in os.walk(args.data_dir)

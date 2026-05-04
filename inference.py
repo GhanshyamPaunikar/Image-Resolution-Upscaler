@@ -103,7 +103,7 @@ def main(args):
         args.checkpoint_dir = f"models/{args.model}/checkpoints"
     checkpoint_path, _ = get_latest_checkpoint(args.checkpoint_dir)
     print(f'Loading checkpoint: {checkpoint_path}')
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     # Support checkpoints saved as {'model_state_dict': ...} or raw state_dict
     state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
     model.load_state_dict(state_dict)
@@ -121,13 +121,10 @@ def main(args):
     # Optionally apply dynamic quantization.
     if args.quantize:
         print("Applying dynamic quantization to the model...")
-        model = torch.quantization.quantize_dynamic(
+        model = torch.ao.quantization.quantize_dynamic(
             model, {nn.Linear}, dtype=torch.qint8
         )
         print("Model quantization complete.")
-
-    # Run inference with mixed precision if possible.
-    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_built() else "cpu"))
     inf_time = 0
     with torch.no_grad():
         if device.type in ['cuda', 'mps']:

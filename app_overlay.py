@@ -268,7 +268,9 @@ def main(args):
     model = TransformerModel().to(device)
     checkpoint_path, _ = get_latest_checkpoint(args.checkpoint_dir)
     print(f"Loading checkpoint from: {checkpoint_path}")
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    state = ckpt.get('model_state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
+    model.load_state_dict(state)
     model.eval()
 
     if args.compile:
@@ -280,7 +282,7 @@ def main(args):
 
     if args.quantize:
         print("Applying dynamic quantization to the model...")
-        model = torch.quantization.quantize_dynamic(
+        model = torch.ao.quantization.quantize_dynamic(
             model, {nn.Linear}, dtype=torch.qint8
         )
         print("Model quantization complete.")

@@ -39,7 +39,7 @@ def main(args):
     ckpt_dir = args.checkpoint_dir or f"models/{args.model}/checkpoints"
     ckpt_path, _ = get_latest_checkpoint(ckpt_dir)
     print(f"Loading checkpoint: {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
     # Support checkpoints saved as {'model_state_dict': ...} or raw state_dict
     state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
     model.load_state_dict(state_dict)
@@ -54,7 +54,7 @@ def main(args):
     # Optional quantization
     if args.quantize:
         import torch.nn as nn
-        model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+        model = torch.ao.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
         print("Model quantized dynamically")
 
     # Prepare transforms
