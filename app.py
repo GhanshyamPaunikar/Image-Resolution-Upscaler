@@ -13,8 +13,6 @@ import time
 
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-from pathlib import Path
-
 import gradio as gr
 import numpy as np
 import torch
@@ -36,6 +34,8 @@ DEVICE = torch.device(
 )
 log.info("Device: %s", DEVICE)
 
+SCALE = 4  # fixed upscale factor throughout
+
 # ---------------------------------------------------------------------------
 # SD x4 Upscaler pipeline
 # MPS + float16 produces numerically incorrect outputs with this model;
@@ -44,6 +44,7 @@ log.info("Device: %s", DEVICE)
 _sd_pipe = None
 _SD_DEVICE = "cpu"
 _SD_DTYPE  = torch.float32
+
 
 def _get_sd_pipe():
     global _sd_pipe
@@ -71,15 +72,14 @@ def run_sd_upscale(
 
     orig = image.convert("RGB")
 
-    # Cap input so output doesn't blow up memory (max 512×512 output = 128×128 input)
-    max_lr_side = 128
     if downscale_first:
         ow, oh = orig.size
-        lr = orig.resize((ow // 4, oh // 4), Image.LANCZOS)
+        lr = orig.resize((ow // SCALE, oh // SCALE), Image.LANCZOS)
     else:
         lr = orig
 
-    # Clamp LR so output stays ≤ 512×512
+    # Clamp LR so output stays ≤ 512×512 (model limit)
+    max_lr_side = 128
     w, h = lr.size
     if max(w, h) > max_lr_side:
         scale_down = max_lr_side / max(w, h)
@@ -99,16 +99,14 @@ def run_sd_upscale(
     ).images[0]
     elapsed = time.perf_counter() - t0
 
-    lines = [
-        f"Model:       Stable Diffusion x4 Upscaler",
-        f"Device:      {_SD_DEVICE.upper()}  (float32)",
-        f"Steps:       {steps}  |  Noise level: {int(noise)}",
-        f"Prompt:      \"{prompt or 'high resolution, sharp, detailed'}\"",
-        f"Input:       {lr.size[0]} × {lr.size[1]}",
-        f"Output:      {result.size[0]} × {result.size[1]}",
-        f"Time:        {elapsed:.1f} s",
-    ]
-    return result, "\n".join(lines)
+    info = "\n".join([
+        f"Model    stabilityai/stable-diffusion-x4-upscaler",
+        f"Device   CPU  (float32)",
+        f"Steps    {steps}   Noise {int(noise)}",
+        f"Input    {lr.size[0]} × {lr.size[1]}   →   Output  {result.size[0]} × {result.size[1]}",
+        f"Time     {elapsed:.1f} s",
+    ])
+    return result, info
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +135,6 @@ def _load_custom_model(model_name: str, quantize: bool) -> nn.Module:
 def run_custom_upscale(
     image: Image.Image | None,
     model_name: str,
-    scale: int,
     downscale_first: bool,
     quantize: bool,
 ) -> tuple[Image.Image | None, Image.Image | None, str]:
@@ -146,10 +143,7 @@ def run_custom_upscale(
 
     available = get_available_models()
     if not available:
-        return None, None, (
-            "No trained models in models/.\n"
-            "Run:  python quick_train.py"
-        )
+        return None, None, "No trained models found.\nRun:  python quick_train.py"
     if model_name not in available:
         return None, None, f"Model '{model_name}' not found. Available: {', '.join(available)}"
 
@@ -162,7 +156,7 @@ def run_custom_upscale(
     to_pil    = transforms.ToPILImage()
     orig = image.convert("RGB")
 
-    lr = orig.resize((orig.size[0] // scale, orig.size[1] // scale), Image.BICUBIC) \
+    lr = orig.resize((orig.size[0] // SCALE, orig.size[1] // SCALE), Image.BICUBIC) \
          if downscale_first else orig
 
     lr_t = to_tensor(lr).unsqueeze(0).to(DEVICE)
@@ -170,20 +164,19 @@ def run_custom_upscale(
     with torch.no_grad():
         if DEVICE.type in ("cuda", "mps"):
             with torch.amp.autocast(device_type=DEVICE.type, dtype=torch.float16):
-                out = model(lr_t, upscale_factor=scale)
+                out = model(lr_t, upscale_factor=SCALE)
         else:
-            out = model(lr_t, upscale_factor=scale)
+            out = model(lr_t, upscale_factor=SCALE)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     sr      = to_pil(out.squeeze(0).cpu().clamp(0, 1))
-    bicubic = lr.resize((lr.size[0] * scale, lr.size[1] * scale), Image.BICUBIC)
+    bicubic = lr.resize((lr.size[0] * SCALE, lr.size[1] * SCALE), Image.BICUBIC)
 
     lines = [
-        f"Device:      {DEVICE.type.upper()}",
-        f"Inference:   {elapsed_ms:.1f} ms",
-        f"Input:       {lr.size[0]} × {lr.size[1]}",
-        f"Output:      {sr.size[0]} × {sr.size[1]}",
-        f"Model:       {model_name}  (scale ×{scale})",
+        f"Model    {model_name}   ×4",
+        f"Device   {DEVICE.type.upper()}",
+        f"Input    {lr.size[0]} × {lr.size[1]}   →   Output  {sr.size[0]} × {sr.size[1]}",
+        f"Time     {elapsed_ms:.1f} ms",
     ]
 
     if downscale_first:
@@ -197,9 +190,8 @@ def run_custom_upscale(
         bic_ssim = compare_ssim(ref_arr, bic_arr, data_range=1.0, channel_axis=-1)
         lines += [
             "",
-            f"Model   — PSNR: {sr_psnr:.2f} dB  |  SSIM: {sr_ssim:.4f}",
-            f"Bicubic — PSNR: {bic_psnr:.2f} dB  |  SSIM: {bic_ssim:.4f}",
-            f"Gain    — PSNR: +{sr_psnr-bic_psnr:.2f} dB  |  SSIM: +{sr_ssim-bic_ssim:.4f}",
+            f"PSNR     Model {sr_psnr:.2f} dB   Bicubic {bic_psnr:.2f} dB   Gain +{sr_psnr-bic_psnr:.2f} dB",
+            f"SSIM     Model {sr_ssim:.4f}   Bicubic {bic_ssim:.4f}   Gain +{sr_ssim-bic_ssim:.4f}",
         ]
 
     return sr, bicubic, "\n".join(lines)
@@ -209,16 +201,81 @@ def run_custom_upscale(
 # UI
 # ---------------------------------------------------------------------------
 _CSS = """
-.app-title  { text-align:center; padding: 1rem 0 0.1rem; }
-.app-sub    { text-align:center; color:#64748b; font-size:0.9rem; margin-bottom:1.2rem; }
-footer      { display:none !important; }
+/* ── Reset / base ─────────────────────────────────────────────────────────── */
+body, .gradio-container { background: #f0f2f5 !important; }
+footer { display: none !important; }
+
+/* ── Header ───────────────────────────────────────────────────────────────── */
+.app-header {
+  text-align: center;
+  padding: 2rem 0 0.25rem;
+}
+.app-header h2 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #111827;
+  margin: 0;
+}
+.app-sub {
+  text-align: center;
+  color: #6b7280;
+  font-size: 0.8rem;
+  margin: 0.2rem 0 1.5rem;
+}
+
+/* ── Cards ────────────────────────────────────────────────────────────────── */
+.card {
+  background: #ffffff;
+  border-radius: 12px !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,.10), 0 1px 2px rgba(0,0,0,.08) !important;
+  border: none !important;
+  padding: 1.25rem !important;
+}
+
+/* ── Tabs ─────────────────────────────────────────────────────────────────── */
+.tab-nav button {
+  font-weight: 500;
+  font-size: 0.875rem;
+  border-radius: 8px 8px 0 0 !important;
+}
+
+/* ── Inputs / outputs ─────────────────────────────────────────────────────── */
+.block { border-radius: 8px !important; border: 1px solid #e5e7eb !important; }
+label { font-weight: 500 !important; font-size: 0.8rem !important; color: #374151 !important; }
+
+/* ── Primary button ───────────────────────────────────────────────────────── */
+button.primary {
+  background: #4f46e5 !important;
+  border-radius: 8px !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.01em !important;
+  box-shadow: 0 1px 2px rgba(79,70,229,.3) !important;
+}
+button.primary:hover {
+  background: #4338ca !important;
+}
+
+/* ── Metrics box ──────────────────────────────────────────────────────────── */
+textarea { font-family: "JetBrains Mono", "Fira Code", monospace !important; font-size: 0.78rem !important; }
 """
 
-_THEME = gr.themes.Soft(
+_THEME = gr.themes.Base(
     primary_hue="indigo",
     secondary_hue="slate",
-    neutral_hue="slate",
+    neutral_hue="gray",
     font=gr.themes.GoogleFont("Inter"),
+    font_mono=gr.themes.GoogleFont("JetBrains Mono"),
+).set(
+    body_background_fill="#f0f2f5",
+    block_background_fill="white",
+    block_border_width="1px",
+    block_border_color="#e5e7eb",
+    block_radius="12px",
+    input_background_fill="white",
+    button_primary_background_fill="#4f46e5",
+    button_primary_background_fill_hover="#4338ca",
+    button_primary_text_color="white",
 )
 
 
@@ -228,13 +285,10 @@ def _model_choices():
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Image Resolution Upscaler") as demo:
+    with gr.Blocks(title="Image Upscaler · 4×") as demo:
 
-        gr.Markdown("## Image Resolution Upscaler", elem_classes="app-title")
-        gr.Markdown(
-            "Stable Diffusion x4 · Custom Transformer · CUDA / MPS / CPU",
-            elem_classes="app-sub",
-        )
+        gr.Markdown("## Image Upscaler", elem_classes="app-header")
+        gr.Markdown("4× super-resolution · Stable Diffusion · Custom Transformer", elem_classes="app-sub")
 
         with gr.Tabs():
 
@@ -242,27 +296,28 @@ def build_ui() -> gr.Blocks:
             # Tab 1 — Stable Diffusion x4
             # ================================================================
             with gr.TabItem("Stable Diffusion x4"):
-                gr.Markdown(
-                    "Uses **stabilityai/stable-diffusion-x4-upscaler** — "
-                    "diffusion-based, produces photorealistic detail. "
-                    "First run loads the model (~7 s), subsequent runs are faster."
-                )
                 with gr.Row(equal_height=False):
-                    with gr.Column(scale=1):
-                        sd_input  = gr.Image(type="pil", label="Input Image", height=280)
+                    with gr.Column(scale=1, min_width=280):
+                        sd_input = gr.Image(type="pil", label="Input", height=260)
                         sd_prompt = gr.Textbox(
-                            label="Prompt (optional)",
+                            label="Prompt",
                             placeholder="high resolution, sharp, detailed",
                             lines=2,
                         )
-                        sd_steps  = gr.Slider(10, 75, value=30, step=5, label="Diffusion Steps  (more = better quality, slower)")
-                        sd_noise  = gr.Slider(0, 100, value=0, step=5,  label="Noise Level  (0 = faithful to input, higher = more creative)")
-                        sd_downscale = gr.Checkbox(value=False, label="Downscale input ÷4 first (only for benchmarking — upload a blurry image instead)")
-                        sd_btn    = gr.Button("Upscale with SD x4 ↑", variant="primary", size="lg")
+                        sd_steps = gr.Slider(10, 75, value=30, step=5,
+                                             label="Diffusion steps")
+                        sd_noise = gr.Slider(0, 100, value=0, step=5,
+                                             label="Noise level  (0 = faithful · 100 = creative)")
+                        sd_downscale = gr.Checkbox(
+                            value=False,
+                            label="Downscale ÷4 before upscaling",
+                            info="Use only for benchmarking",
+                        )
+                        sd_btn = gr.Button("Upscale ×4", variant="primary", size="lg")
 
                     with gr.Column(scale=2):
-                        sd_out     = gr.Image(type="pil", label="SD x4 Output", height=420)
-                        sd_metrics = gr.Textbox(label="Info", lines=8, interactive=False,
+                        sd_out     = gr.Image(type="pil", label="Output · 4×", height=440)
+                        sd_metrics = gr.Textbox(label="Info", lines=6, interactive=False,
                                                 placeholder="Results will appear here…")
 
                 sd_btn.click(
@@ -274,38 +329,35 @@ def build_ui() -> gr.Blocks:
             # ================================================================
             # Tab 2 — Custom Transformer model
             # ================================================================
-            with gr.TabItem("Custom Model (Fastv2)"):
-                gr.Markdown(
-                    "Uses your locally trained **Fastv2** (or any other model in `models/`). "
-                    "Fast inference, all scale factors supported."
-                )
+            with gr.TabItem("Custom Model"):
                 with gr.Row(equal_height=False):
-                    with gr.Column(scale=1):
-                        cm_input = gr.Image(type="pil", label="Input Image", height=260)
+                    with gr.Column(scale=1, min_width=280):
+                        cm_input = gr.Image(type="pil", label="Input", height=260)
                         with gr.Row():
                             cm_model = gr.Dropdown(
                                 choices=_model_choices(), value=None,
                                 label="Model", scale=3, interactive=True,
                             )
-                            cm_refresh = gr.Button("⟳", scale=1, min_width=48, size="sm")
-                        cm_scale     = gr.Radio([2, 3, 4, 6], value=4, label="Scale Factor")
+                            cm_refresh = gr.Button("⟳", scale=1, min_width=44, size="sm")
                         with gr.Row():
-                            cm_downscale = gr.Checkbox(value=True,  label="Downscale input first", info="Enables PSNR/SSIM")
-                            cm_quantize  = gr.Checkbox(value=False, label="Quantize (int8)",       info="Faster, slightly lower quality")
-                        cm_btn = gr.Button("Upscale ↑", variant="primary", size="lg")
+                            cm_downscale = gr.Checkbox(value=True,  label="Downscale ÷4 first",
+                                                       info="Enables PSNR / SSIM metrics")
+                            cm_quantize  = gr.Checkbox(value=False, label="Int8 quantize",
+                                                       info="Faster · slight quality trade-off")
+                        cm_btn = gr.Button("Upscale ×4", variant="primary", size="lg")
 
                     with gr.Column(scale=2):
                         with gr.Tabs():
                             with gr.TabItem("SR Output"):
-                                cm_out  = gr.Image(type="pil", label="Model Output", height=380)
-                            with gr.TabItem("Bicubic Baseline"):
-                                cm_bic  = gr.Image(type="pil", label="Bicubic", height=380)
-                        cm_metrics = gr.Textbox(label="Metrics & Info", lines=8, interactive=False,
+                                cm_out = gr.Image(type="pil", label="Model · ×4", height=400)
+                            with gr.TabItem("Bicubic"):
+                                cm_bic = gr.Image(type="pil", label="Bicubic baseline · ×4", height=400)
+                        cm_metrics = gr.Textbox(label="Metrics", lines=6, interactive=False,
                                                 placeholder="Results will appear here…")
 
                 cm_btn.click(
                     fn=run_custom_upscale,
-                    inputs=[cm_input, cm_model, cm_scale, cm_downscale, cm_quantize],
+                    inputs=[cm_input, cm_model, cm_downscale, cm_quantize],
                     outputs=[cm_out, cm_bic, cm_metrics],
                 )
                 cm_refresh.click(
